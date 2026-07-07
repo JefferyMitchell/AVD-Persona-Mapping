@@ -1,0 +1,14 @@
+# Assessment secrets & generated artifacts — never commit these
+avd-assessment.env
+avd-cleanup.sh
+_avd_role.json
+
+# Collected data (may contain environment details / usernames)
+avd-data-*/
+*.csv
+*.json
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
