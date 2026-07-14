@@ -8,6 +8,8 @@ are grounded in the customer's actual numbers rather than assumptions.
 The customer runs the scripts in their own Azure tenant. Nothing leaves their
 control until *they* generate a time-limited, read-only link and share it.
 
+📖 **[Full guided documentation → jefferymitchell.github.io/AVD-Persona-Mapping](https://jefferymitchell.github.io/AVD-Persona-Mapping/)**
+
 ---
 
 ## Why this exists

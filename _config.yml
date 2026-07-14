@@ -1,0 +1,17 @@
+title: AVD Persona Mapping
+description: Read-only AVD environment discovery toolkit for Citrix persona mapping
+baseurl: "/AVD-Persona-Mapping"
+url: "https://jefferymitchell.github.io"
+
+theme: just-the-docs
+
+aux_links:
+  "GitHub":
+    - "https://github.com/JefferyMitchell/AVD-Persona-Mapping"
+
+aux_links_new_tab: true
+
+nav_sort: order
+
+plugins:
+  - jekyll-seo-tag

@@ -5,10 +5,19 @@ _avd_role.json
 
 # Collected data (may contain environment details / usernames)
 avd-data-*/
-*.csv
-*.json
 
-# OS / editor noise
+# Jekyll / GitHub Pages
+_site/
+.sass-cache/
+.jekyll-cache/
+.jekyll-metadata
+Gemfile.lock
+
+# OS
 .DS_Store
 Thumbs.db
+
+# Editor
+.vscode/
 *.swp
+*.swo
