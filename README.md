@@ -127,18 +127,44 @@ customer to generate a **read-only, 7-day SAS link** to share.
                                ──> hashes usernames
                                ──> uploads JSON/CSV to results container
    customer generates read-only 7-day SAS ──> shares link
-[Architect] downloads container ──> persona mapping & sizing analysis
+[Architect] downloads container ──> avd-analyze.py ──> assessment report
 ```
 
 ---
 
+## Analyzer
+
+`avd-analyze.py` turns a collected `avd-data-*` folder into a customer-ready
+persona-mapping assessment. Pure Python 3.8+ standard library — no installs;
+runs in Cloud Shell or on the architect's machine.
+
+```bash
+python3 avd-analyze.py <avd-data-folder>
+# writes <folder>/analysis/report.md  and  persona_mapping.csv
+```
+
+It implements the Citrix/VDI sizing methodology adapted to AVD:
+
+- **True event-based (sweep-line) concurrency** — peak concurrent *users*
+  (per-user merged intervals) and *sessions* (per machine); never simple hourly
+  counts. Full 0–23 hourly profile + daily peaks.
+- **Persona classification** — Task Worker Light/Medium/Heavy from vCPU-per-user
+  (`Machine_vCPU ÷ peak concurrency` over the top-10 machines: ≤0.5 / 0.51–1.19
+  / ≥1.2); Knowledge Worker pooled (SingleSession+Random) / personal
+  (SingleSession+Static); Power Worker (GPU SKU); Custom.
+- **Usage & sizing** — per-user-per-day merged connected hours → average over
+  *active* users → average of daily averages → × workdays for monthly demand;
+  weekday/weekend split.
+- **Non-exclusive personas**, multi-group overlap, shelfware (idle-host)
+  detection, and an explicit assumptions section.
+
+Output: a self-contained `report.md` (readable, section per stage) plus
+`persona_mapping.csv` pre-filled to the Citrix Flex persona template.
+
 ## Roadmap
 
-- **Companion analyzer** — ingests the container of JSON/CSV and produces a
-  customer-ready assessment: concurrency peaks, shelfware %, density vs.
-  configured max, VM SKU distribution (spend baseline), connection-failure
-  breakdown. Output format TBD (Word doc / HTML one-pager / slides).
 - **Cost-estimation layer** — map discovered VM SKUs to Azure retail pricing for
-  a spend baseline.
+  a spend baseline (the collector already captures SKU + region).
+- **Optional `.xlsx`** multi-sheet output (currently Markdown + CSV, stdlib only).
 - **Multi-subscription collection** in a single run (collect currently targets
   one subscription via the env file).
