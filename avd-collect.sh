@@ -54,6 +54,18 @@ hash_user() {
   fi
 }
 
+# vm_size_lookup <region> <size> -> echoes "vCPU,memoryGB" (blank if unknown).
+# az vm list-skus is cached per region so we call it at most once per region.
+vm_size_lookup() {
+  local region="$1" size="$2"
+  local cache="$OUT/_sku_${region}.json"
+  if [[ ! -f "$cache" ]]; then
+    az vm list-skus -l "$region" --resource-type virtualMachines --only-show-errors -o json 2>/dev/null > "$cache" || echo "[]" > "$cache"
+    [[ -s "$cache" ]] || echo "[]" > "$cache"
+  fi
+  jq -r --arg s "$size" 'map(select(.name==$s and .resourceType=="virtualMachines"))[0].capabilities as $c | (($c[]?|select(.name=="vCPUs")|.value)//"") + "," + (($c[]?|select(.name=="MemoryGB")|.value)//"")' "$cache" 2>/dev/null || echo ","
+}
+
 echo "==> Lookback: ${LOOKBACK_DAYS}d | usernames: $([[ $HASH_USERS -eq 1 ]] && echo hashed || echo RAW)"
 
 # --- Ensure read-only extensions ---------------------------------------------
@@ -61,9 +73,13 @@ az extension add --name desktopvirtualization --only-show-errors >/dev/null 2>&1
 az extension add --name log-analytics --only-show-errors >/dev/null 2>&1 || true
 
 # --- Configuration (ARM) -----------------------------------------------------
-echo "subscription,resourceGroup,hostPoolName,type,loadBalancer,maxSessionLimit,startVMOnConnect,validationEnvironment,sessionHosts,appGroups" > "$OUT/hostpools.csv"
-echo "resourceGroup,hostPoolName,sessionHostName,status,sessions,allowNewSession" > "$OUT/sessionhosts.csv"
+echo "subscription,resourceGroup,hostPoolName,type,loadBalancer,maxSessionLimit,startVMOnConnect,validationEnvironment,sessionHosts,appGroups,region,sessionSupport,allocationType" > "$OUT/hostpools.csv"
+echo "resourceGroup,hostPoolName,sessionHostName,status,sessions,allowNewSession,vmName,vmSize,vCPU,memoryGB,osType,imageOffer,imageSku,region" > "$OUT/sessionhosts.csv"
 echo "resourceGroup,hostPoolName,appGroupName,type,assignedPrincipals" > "$OUT/appgroups.csv"
+# Session-level records (one row per connected session) for the analyzer's
+# true-overlap concurrency + usage engine. userID is hashed inside the KQL query
+# below, so raw usernames never leave Azure.
+echo "userID,sessionID,machineID,desktopGroup,startTime,endTime" > "$OUT/sessions.csv"
 
 echo "==> Pulling host pool configuration..."
 az desktopvirtualization hostpool list --only-show-errors -o json 2>/dev/null > "$OUT/hostpools.json" || echo "[]" > "$OUT/hostpools.json"
@@ -79,6 +95,16 @@ jq -c '.[]' "$OUT/hostpools.json" | while read -r hp; do
   MAX=$(echo "$hp" | jq -r '.maxSessionLimit // "n/a"')
   SVMOC=$(echo "$hp" | jq -r '.startVMOnConnect // false')
   VALENV=$(echo "$hp" | jq -r '.validationEnvironment // false')
+  HP_REGION=$(echo "$hp" | jq -r '.location // ""')
+  # Map AVD host-pool shape onto the Citrix data model the analyzer expects:
+  #   allocationType: Personal -> Static (dedicated); Pooled -> Random (pooled)
+  #   sessionSupport: Personal or maxSessions<=1 -> SingleSession; else MultiSession
+  if [[ "$HP_TYPE" == "Personal" ]]; then
+    ALLOC="Static"; SESSUP="SingleSession"
+  else
+    ALLOC="Random"
+    if [[ "$MAX" =~ ^[0-9]+$ ]] && [[ "$MAX" -gt 1 ]]; then SESSUP="MultiSession"; else SESSUP="SingleSession"; fi
+  fi
 
   # Session hosts: the stable 'desktopvirtualization' CLI extension exposes no
   # session-host command, so query ARM directly. Response is
@@ -90,7 +116,22 @@ jq -c '.[]' "$OUT/hostpools.json" | while read -r hp; do
   SH_COUNT=$(jq 'length' "$OUT/_sh.json")
   jq -c '.[]' "$OUT/_sh.json" | while read -r sh; do
     SH_NAME=$(echo "$sh" | jq -r '.name' | sed 's#.*/##')
-    echo "$RG,$HP_NAME,$SH_NAME,$(echo "$sh" | jq -r '.properties.status // "Unknown"'),$(echo "$sh" | jq -r '.properties.sessions // 0'),$(echo "$sh" | jq -r '.properties.allowNewSession // true')" >> "$OUT/sessionhosts.csv"
+    # Enrich with the backing VM's size -> vCPU/RAM, OS, image, region.
+    VM_ID=$(echo "$sh" | jq -r '.properties.resourceId // ""')
+    VM_NAME=""; VM_SIZE=""; VCPU=""; MEMGB=""; OSTYPE=""; IMG_OFFER=""; IMG_SKU=""; SH_REGION=""
+    if [[ -n "$VM_ID" ]]; then
+      VM_JSON=$(az vm show --ids "$VM_ID" --only-show-errors -o json 2>/dev/null || echo "{}")
+      VM_NAME=$(echo "$VM_JSON" | jq -r '.name // ""')
+      VM_SIZE=$(echo "$VM_JSON" | jq -r '.hardwareProfile.vmSize // ""')
+      SH_REGION=$(echo "$VM_JSON" | jq -r '.location // ""')
+      OSTYPE=$(echo "$VM_JSON" | jq -r '.storageProfile.osDisk.osType // ""')
+      IMG_OFFER=$(echo "$VM_JSON" | jq -r '.storageProfile.imageReference.offer // ""')
+      IMG_SKU=$(echo "$VM_JSON" | jq -r '.storageProfile.imageReference.sku // ""')
+      if [[ -n "$VM_SIZE" && -n "$SH_REGION" ]]; then
+        SIZING=$(vm_size_lookup "$SH_REGION" "$VM_SIZE"); VCPU="${SIZING%%,*}"; MEMGB="${SIZING##*,}"
+      fi
+    fi
+    echo "$RG,$HP_NAME,$SH_NAME,$(echo "$sh" | jq -r '.properties.status // "Unknown"'),$(echo "$sh" | jq -r '.properties.sessions // 0'),$(echo "$sh" | jq -r '.properties.allowNewSession // true'),$VM_NAME,$VM_SIZE,$VCPU,$MEMGB,$OSTYPE,$IMG_OFFER,$IMG_SKU,$SH_REGION" >> "$OUT/sessionhosts.csv"
   done
 
   az desktopvirtualization applicationgroup list --only-show-errors -o json 2>/dev/null \
@@ -104,10 +145,10 @@ jq -c '.[]' "$OUT/hostpools.json" | while read -r hp; do
     echo "$AG_RG,$HP_NAME,$AG_NAME,$AG_TYPE,$ASSIGNED" >> "$OUT/appgroups.csv"
   done
 
-  echo "$AVD_SUB_ID,$RG,$HP_NAME,$HP_TYPE,$LB,$MAX,$SVMOC,$VALENV,$SH_COUNT,$AG_COUNT" >> "$OUT/hostpools.csv"
+  echo "$AVD_SUB_ID,$RG,$HP_NAME,$HP_TYPE,$LB,$MAX,$SVMOC,$VALENV,$SH_COUNT,$AG_COUNT,$HP_REGION,$SESSUP,$ALLOC" >> "$OUT/hostpools.csv"
   echo "    - $HP_NAME ($HP_TYPE, $SH_COUNT hosts, $AG_COUNT app groups)"
 done
-rm -f "$OUT/_sh.json" "$OUT/_ag.json"
+rm -f "$OUT/_sh.json" "$OUT/_ag.json" "$OUT"/_sku_*.json
 
 # --- Usage (Log Analytics / KQL) --------------------------------------------
 echo "==> Discovering workspaces with AVD data..."
@@ -134,6 +175,21 @@ az monitor log-analytics workspace list --only-show-errors -o json 2>/dev/null |
     echo "$(hash_user "$UN"),$(echo "$u" | jq -r '.sessions // 0'),$(echo "$u" | jq -r '.lastSeen // ""')" >> "$OUT/users_${WS_NAME}.csv"
   done
   rm -f "$OUT/_users_raw.json"
+
+  # Session-level records: one row per connected session (Started->Connected->
+  # Completed reconstructed by CorrelationId). The username is SHA-256 hashed
+  # in-query with the per-run salt, so raw usernames never leave Azure. This is
+  # the raw material for the analyzer's true time-overlap concurrency + usage.
+  if [[ "$HASH_USERS" -eq 1 ]]; then
+    USERID_EXPR="substring(hash_sha256(strcat('${SALT}', UserName)), 0, 16)"
+  else
+    USERID_EXPR="UserName"
+  fi
+  KQL_SESSIONS="WVDConnections | where TimeGenerated > ago(${LOOKBACK_DAYS}d) | where State in ('Connected','Completed') | summarize StartTime=min(TimeGenerated), EndTime=max(TimeGenerated), hadConnected=countif(State=='Connected') by CorrelationId, UserName, SessionHostName, _ResourceId | where hadConnected > 0 and EndTime > StartTime | extend DesktopGroup=tostring(split(_ResourceId,'/')[-1]), UserID=${USERID_EXPR} | project UserID, SessionID=CorrelationId, MachineID=SessionHostName, DesktopGroup, StartTime, EndTime | order by StartTime asc"
+  az monitor log-analytics query -w "$WS_CID" --analytics-query "$KQL_SESSIONS" --only-show-errors -o json 2>/dev/null \
+    | jq -r '.[] | [.UserID, .SessionID, .MachineID, .DesktopGroup, .StartTime, .EndTime] | @csv' >> "$OUT/sessions.csv" 2>/dev/null || true
+  SESS_COUNT=$(($(wc -l < "$OUT/sessions.csv") - 1))
+  echo "    $SESS_COUNT session record(s) exported"
 done
 
 # --- Manifest ----------------------------------------------------------------
