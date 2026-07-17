@@ -73,28 +73,33 @@ echo "    $HP_COUNT host pool(s)"
 jq -c '.[]' "$OUT/hostpools.json" | while read -r hp; do
   HP_NAME=$(echo "$hp" | jq -r '.name')
   HP_ID=$(echo "$hp" | jq -r '.id')
-  RG=$(echo "$HP_ID" | sed -n 's#.*/resourceGroups/\([^/]*\)/.*#\1#p')
+  RG=$(echo "$HP_ID" | sed -n 's#.*/[Rr]esource[Gg]roups/\([^/]*\)/.*#\1#p')
   HP_TYPE=$(echo "$hp" | jq -r '.hostPoolType // "Unknown"')
   LB=$(echo "$hp" | jq -r '.loadBalancerType // "Unknown"')
   MAX=$(echo "$hp" | jq -r '.maxSessionLimit // "n/a"')
   SVMOC=$(echo "$hp" | jq -r '.startVMOnConnect // false')
   VALENV=$(echo "$hp" | jq -r '.validationEnvironment // false')
 
-  az desktopvirtualization session-host list --host-pool-name "$HP_NAME" --resource-group "$RG" \
-    --only-show-errors -o json 2>/dev/null > "$OUT/_sh.json" || echo "[]" > "$OUT/_sh.json"
+  # Session hosts: the stable 'desktopvirtualization' CLI extension exposes no
+  # session-host command, so query ARM directly. Response is
+  # {value:[{name, properties:{status,sessions,allowNewSession}}]}.
+  az rest --method GET \
+    --url "https://management.azure.com${HP_ID}/sessionHosts?api-version=2024-04-03" \
+    --only-show-errors -o json 2>/dev/null | jq '.value // []' > "$OUT/_sh.json" 2>/dev/null || echo "[]" > "$OUT/_sh.json"
+  [[ -s "$OUT/_sh.json" ]] || echo "[]" > "$OUT/_sh.json"
   SH_COUNT=$(jq 'length' "$OUT/_sh.json")
   jq -c '.[]' "$OUT/_sh.json" | while read -r sh; do
     SH_NAME=$(echo "$sh" | jq -r '.name' | sed 's#.*/##')
-    echo "$RG,$HP_NAME,$SH_NAME,$(echo "$sh" | jq -r '.status // "Unknown"'),$(echo "$sh" | jq -r '.sessions // 0'),$(echo "$sh" | jq -r '.allowNewSession // true')" >> "$OUT/sessionhosts.csv"
+    echo "$RG,$HP_NAME,$SH_NAME,$(echo "$sh" | jq -r '.properties.status // "Unknown"'),$(echo "$sh" | jq -r '.properties.sessions // 0'),$(echo "$sh" | jq -r '.properties.allowNewSession // true')" >> "$OUT/sessionhosts.csv"
   done
 
-  az desktopvirtualization application-group list --only-show-errors -o json 2>/dev/null \
+  az desktopvirtualization applicationgroup list --only-show-errors -o json 2>/dev/null \
     --query "[?contains(hostPoolArmPath, '$HP_NAME')]" > "$OUT/_ag.json" || echo "[]" > "$OUT/_ag.json"
   AG_COUNT=$(jq 'length' "$OUT/_ag.json")
   jq -c '.[]' "$OUT/_ag.json" | while read -r ag; do
     AG_NAME=$(echo "$ag" | jq -r '.name')
     AG_TYPE=$(echo "$ag" | jq -r '.applicationGroupType // "Unknown"')
-    AG_RG=$(echo "$ag" | jq -r '.id' | sed -n 's#.*/resourceGroups/\([^/]*\)/.*#\1#p')
+    AG_RG=$(echo "$ag" | jq -r '.id' | sed -n 's#.*/[Rr]esource[Gg]roups/\([^/]*\)/.*#\1#p')
     ASSIGNED=$(az role assignment list --scope "$(echo "$ag" | jq -r '.id')" --only-show-errors --query "length(@)" -o tsv 2>/dev/null || echo "0")
     echo "$AG_RG,$HP_NAME,$AG_NAME,$AG_TYPE,$ASSIGNED" >> "$OUT/appgroups.csv"
   done
@@ -113,7 +118,8 @@ KQL_DENSITY="WVDConnections | where TimeGenerated > ago(${LOOKBACK_DAYS}d) | whe
 az monitor log-analytics workspace list --only-show-errors -o json 2>/dev/null | jq -c '.[]' | while read -r ws; do
   WS_NAME=$(echo "$ws" | jq -r '.name')
   WS_CID=$(echo "$ws" | jq -r '.customerId')
-  HAS=$(az monitor log-analytics query -w "$WS_CID" --analytics-query "WVDConnections | take 1 | count" --only-show-errors -o tsv 2>/dev/null | tail -1 || echo "0")
+  # -o tsv appends a TableName column ("<count>\tPrimaryResult"); take field 1.
+  HAS=$(az monitor log-analytics query -w "$WS_CID" --analytics-query "WVDConnections | count" --only-show-errors -o tsv 2>/dev/null | tail -1 | cut -f1 || echo "0")
   [[ "$HAS" =~ ^[0-9]+$ ]] && [[ "$HAS" -gt 0 ]] || continue
   echo "    workspace $WS_NAME has AVD data"
 
