@@ -28,6 +28,7 @@ Methodology mirrors the team's Citrix/VDI analysis prompt, adapted to AVD:
 
 import argparse
 import csv
+import html
 import json
 import os
 import re
@@ -596,6 +597,86 @@ def build_report(d, groups, usage_group, usage_persona, args):
     return "\n".join(L)
 
 
+_HTML_CSS = """
+body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+ line-height:1.5;color:#1a1a2e;max-width:960px;margin:2rem auto;padding:0 1.2rem}
+h1{border-bottom:3px solid #5a3fc0;padding-bottom:.3rem}
+h2{margin-top:2rem;border-bottom:1px solid #ddd;padding-bottom:.2rem;color:#3a2a80}
+h3{color:#5a3fc0;margin-top:1.4rem}
+table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:.92rem}
+th,td{border:1px solid #d0d0e0;padding:.4rem .6rem;text-align:left}
+th{background:#f0edfa}tr:nth-child(even) td{background:#fafafe}
+code{background:#f3f2fa;padding:.1rem .3rem;border-radius:3px;font-size:.9em}
+pre{background:#1e1e2e;color:#e8e8f0;padding:1rem;border-radius:6px;overflow-x:auto;
+ font-size:.82rem;line-height:1.25}
+pre code{background:none;color:inherit}
+em{color:#666}hr{border:none;border-top:1px solid #ddd;margin:2rem 0}
+"""
+
+
+def _md_inline(t):
+    t = html.escape(t)
+    t = re.sub(r"`([^`]+)`", r"<code>\1</code>", t)
+    t = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", t)
+    t = re.sub(r"(?<!\*)\*([^*\s][^*]*)\*(?!\*)", r"<em>\1</em>", t)
+    t = re.sub(r"(?<![\w])_([^_]+)_(?![\w])", r"<em>\1</em>", t)
+    return t
+
+
+def md_to_html(md, title="AVD Persona Mapping — Report"):
+    """Minimal Markdown -> self-contained HTML for the report we generate."""
+    out, i, lines = [], 0, md.split("\n")
+    in_code = False
+    while i < len(lines):
+        line = lines[i]
+        if line.strip().startswith("```"):
+            if not in_code:
+                out.append("<pre><code>"); in_code = True
+            else:
+                out.append("</code></pre>"); in_code = False
+            i += 1
+            continue
+        if in_code:
+            out.append(html.escape(line)); i += 1
+            continue
+        if line.startswith("### "):
+            out.append(f"<h3>{_md_inline(line[4:])}</h3>")
+        elif line.startswith("## "):
+            out.append(f"<h2>{_md_inline(line[3:])}</h2>")
+        elif line.startswith("# "):
+            out.append(f"<h1>{_md_inline(line[2:])}</h1>")
+        elif line.strip() == "---":
+            out.append("<hr>")
+        elif line.lstrip().startswith("- "):
+            indent = len(line) - len(line.lstrip())
+            out.append("<ul>" if indent < 4 else "<ul style='margin-left:1rem'>")
+            while i < len(lines) and lines[i].lstrip().startswith("- "):
+                out.append(f"<li>{_md_inline(lines[i].lstrip()[2:])}</li>")
+                i += 1
+            out.append("</ul>")
+            continue
+        elif line.startswith("|"):
+            rows = []
+            while i < len(lines) and lines[i].startswith("|"):
+                rows.append(lines[i]); i += 1
+            cells = [[c.strip() for c in r.strip("|").split("|")] for r in rows]
+            out.append("<table>")
+            if cells:
+                out.append("<tr>" + "".join(f"<th>{_md_inline(c)}</th>" for c in cells[0]) + "</tr>")
+                for r in cells[2:]:  # skip |---| separator
+                    out.append("<tr>" + "".join(f"<td>{_md_inline(c)}</td>" for c in r) + "</tr>")
+            out.append("</table>")
+            continue
+        elif line.strip():
+            out.append(f"<p>{_md_inline(line)}</p>")
+        i += 1
+    body = "\n".join(out)
+    return (f"<!doctype html><html><head><meta charset='utf-8'>"
+            f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            f"<title>{html.escape(title)}</title><style>{_HTML_CSS}</style></head>"
+            f"<body>{body}</body></html>")
+
+
 TEMPLATE_HEADER = [
     "Persona", "Citrix Std config", "Customer specific VM sizing",
     "Customer specific persona names", "Delivery Mechanism",
@@ -678,11 +759,14 @@ def main():
     report = build_report(d, groups, usage_group, usage_persona, args)
     with open(os.path.join(out_dir, "report.md"), "w", encoding="utf-8") as f:
         f.write(report)
+    with open(os.path.join(out_dir, "report.html"), "w", encoding="utf-8") as f:
+        f.write(md_to_html(report))
     write_template_csv(os.path.join(out_dir, "persona_mapping.csv"), d, groups, usage_group)
 
     print(report)
-    print(f"\n[written] {os.path.join(out_dir, 'report.md')}")
-    print(f"[written] {os.path.join(out_dir, 'persona_mapping.csv')}")
+    print(f"\n[written] {os.path.join(out_dir, 'report.md')}   (Markdown)")
+    print(f"[written] {os.path.join(out_dir, 'report.html')}   (open in a browser)")
+    print(f"[written] {os.path.join(out_dir, 'persona_mapping.csv')}   (open in Excel)")
 
 
 if __name__ == "__main__":
