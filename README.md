@@ -8,7 +8,9 @@ are grounded in the customer's actual numbers rather than assumptions.
 The customer runs the scripts in their own Azure tenant. Nothing leaves their
 control until *they* generate a time-limited, read-only link and share it.
 
-📖 **[Full guided documentation → jefferymitchell.github.io/AVD-Persona-Mapping](https://jefferymitchell.github.io/AVD-Persona-Mapping/)**
+📖 **Full guided documentation:** see the [`docs/`](docs/) folder (Prerequisites → Phase 1 → Phase 2 → Sharing → Cleanup → Troubleshooting).
+
+> This repo is **private**. The docs are a Jekyll site but public GitHub Pages hosting is intentionally disabled — read the Markdown in `docs/` directly, or run `bundle exec jekyll serve` locally. Re-enabling Pages would republish the site publicly (this plan has no private-Pages option).
 
 ---
 

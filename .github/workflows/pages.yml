@@ -1,8 +1,12 @@
 name: Deploy Jekyll site to Pages
 
+# Manual-only. The repo is private and GitHub Pages is intentionally unpublished
+# (the docs contain Citrix-internal methodology). The automatic push trigger is
+# removed so pushes don't kick off deploy runs that fail with Pages disabled.
+# To republish: re-enable Pages on the repo, then run this workflow manually
+# (Actions tab -> this workflow -> Run workflow). NOTE: republishing makes the
+# site PUBLIC again — this plan has no private-Pages option.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
