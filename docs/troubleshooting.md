@@ -77,6 +77,30 @@ az monitor log-analytics query \
 
 If this returns 0, diagnostics are not configured or the data has aged out of retention. Config-only collection is still useful — and the lack of telemetry is itself a finding.
 
+### Usage queries fail with "access denied from <IP>" (workspace locked down)
+
+The KQL queries error even though the workspace exists and has data, with something like:
+
+```
+InsufficientAccessError / NspValidationFailedError:
+Access to workspace '<name>' from '<your IP>' is denied.
+```
+
+This is **not** a permissions problem with the collector identity — it's the customer's **network** posture. The Log Analytics workspace has **public query access disabled** and is reachable only over **Private Link** or from within an **Azure Monitor Private Link Scope / Network Security Perimeter**. Collection from Cloud Shell (which egresses from a public IP) is blocked at the network layer before RBAC is even evaluated.
+
+This is a deliberate, mature security choice — worth noting positively in the assessment, not a defect. To collect usage data anyway, choose one with the customer:
+
+- **Run collection from inside their network.** Use a jump host / VM on a VNet that's in the workspace's Private Link scope, or Cloud Shell with VNet integration. This is the cleanest option and keeps the read-only model intact.
+- **Have the workspace admin temporarily allow query.** Either add the collector host's egress IP to the Network Security Perimeter / firewall rules, or re-enable public query for the assessment window:
+  ```bash
+  az monitor log-analytics workspace update \
+    -g <rg> -n <workspace> --query-access Enabled
+  ```
+  (Revert to `Disabled` afterward — this is the customer's call, not the collector's.)
+- **Fall back to config-only.** ARM configuration (host pools, session hosts, app groups) collects fine regardless — only the KQL usage sections are blocked. The locked-down workspace itself becomes a talking point.
+
+> **Note:** the same setting exists at deployment time. Terraform's Azure Verified Module for Log Analytics (`avm-res-operationalinsights-workspace`) **disables** public ingestion and query by default (it assumes Private Link), whereas the raw `azurerm_log_analytics_workspace` resource enables both. A workspace built from AVM without Private Link wiring can therefore reject queries out of the box.
+
 ### Usage data looks thin or truncated
 
 The default lookback is 30 days. If workspace retention is shorter than that, you only get what's retained. If retention is longer, widen the window:
