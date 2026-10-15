@@ -134,6 +134,8 @@ customer to generate a **read-only, 7-day SAS link** to share.
 
 ## Analyzer
 
+📖 Full breakdown of every calculation: [`docs/analyze.md`](docs/analyze.md).
+
 `avd-analyze.py` turns a collected `avd-data-*` folder into a customer-ready
 persona-mapping assessment. Pure Python 3.8+ standard library — no installs;
 runs in Cloud Shell or on the architect's machine.

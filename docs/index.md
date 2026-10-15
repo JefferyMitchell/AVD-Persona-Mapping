@@ -21,6 +21,7 @@ You run everything in your own Azure Cloud Shell. **Nothing leaves your control*
 | **[Phase 1 — Setup](phase-1-setup.md)** | A customer administrator, once | Creates a throwaway resource group, a private storage account, and a **scoped read-only collector identity** |
 | **[Phase 2 — Collect](phase-2-collect.md)** | The collector identity | Reads host-pool config + usage, hashes usernames, uploads results to the storage account |
 | **[Share](sharing.md)** | The customer | Generates a read-only, 7-day SAS link and shares it with the architect |
+| **[Analyze](analyze.md)** | The Citrix architect | Runs `avd-analyze.py` on the shared data to produce the persona-mapping report |
 | **[Cleanup](cleanup.md)** | The customer | One command removes everything the toolkit created |
 
 ## The Security Model
@@ -50,7 +51,8 @@ A single identity can't both *create* a storage account and be *read-only* — c
 2. Phase 1: Setup →  docs/phase-1-setup
 3. Phase 2: Collect →  docs/phase-2-collect
 4. Share the read-only SAS link
-5. Clean up when done
+5. Analyze the results →  docs/analyze
+6. Clean up when done
 ```
 
 ## Disclaimer

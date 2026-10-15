@@ -58,6 +58,10 @@ https://<storage-account>.blob.core.windows.net/results?<sas-token>
 
 > Adjust `--permissions` or `--expiry` if your security policy requires something tighter. `rl` for 7 days is the recommended default.
 
+---
+
+Next: [Analyze the Results](analyze.md)
+
 ## Send it to the architect
 
 Share the URL through whatever channel your organisation uses for time-limited credentials. The architect downloads the container contents and builds the persona mapping and sizing analysis from it.
