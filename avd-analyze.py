@@ -24,6 +24,12 @@ Methodology mirrors the team's Citrix/VDI analysis prompt, adapted to AVD:
       daily averages -> x N workdays for monthly
     - Personas are non-exclusive (a user in two pools counts in both)
     - Task Worker density via vCPU-per-user = Machine_vCPU / peak concurrency
+    - When AVD Insights performance counters are present (hostperf.csv), the
+      Task Worker band is instead MEASURED: the vCPU per user required to hold
+      p95 CPU at 80% during each host's peak-concurrency hours. Memory per
+      user, input delay, disk latency and RTT are reported alongside.
+    - hostapps.csv (per-process input-delay counter) gives an application
+      profile per desktop group with no agent and no user identifiers.
 """
 
 import argparse
@@ -90,6 +96,19 @@ def find_one(folder, pattern):
         if rx.match(fn):
             return os.path.join(folder, fn)
     return None
+
+
+def _num(v):
+    """Float or None for a CSV cell (blank cells are None)."""
+    if v is None:
+        return None
+    v = str(v).strip()
+    if not v:
+        return None
+    try:
+        return float(v)
+    except ValueError:
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -219,6 +238,34 @@ class Data:
                 "end": e,
             })
 
+        # hourly host performance (AVD Insights counters), keyed by short host
+        self.perf = defaultdict(list)
+        for r in read_csv(os.path.join(folder, "hostperf.csv")):
+            h = parse_ts(r.get("hour"))
+            key = short_host(r.get("machineID", ""))
+            if not h or not key:
+                continue
+            row = {f: _num(r.get(f)) for f in PERF_FIELDS}
+            row["hour"] = h
+            self.perf[key].append(row)
+        self.has_perf = bool(self.perf)
+
+        # application inventory per host (process image names only)
+        self.apps = defaultdict(list)
+        for r in read_csv(os.path.join(folder, "hostapps.csv")):
+            key = short_host(r.get("machineID", ""))
+            proc = (r.get("process") or "").strip().lower()
+            if not key or not proc:
+                continue
+            self.apps[key].append({
+                "process": proc,
+                "activeHours": _num(r.get("activeHours")) or 0.0,
+                "sessionDays": _num(r.get("sessionDays")) or 0.0,
+                "delayAvg": _num(r.get("inputDelayAvgMs")),
+                "delayP95": _num(r.get("inputDelayP95Ms")),
+            })
+        self.has_apps = bool(self.apps)
+
     def vcpu_of(self, machine_short):
         r = self.machine.get(machine_short)
         if not r:
@@ -227,6 +274,15 @@ class Data:
             return float(r.get("vCPU") or "")
         except ValueError:
             return None
+
+    def mem_gb_of(self, machine_short):
+        r = self.machine.get(machine_short)
+        return _num(r.get("memoryGB")) if r else None
+
+
+PERF_FIELDS = ["cpuAvgPct", "cpuP95Pct", "memAvailAvgMB", "memAvailMinMB",
+               "diskLatencyAvgMs", "inputDelayP95Ms", "inputDelayMaxMs",
+               "rttAvgMs", "samples"]
 
 
 # --------------------------------------------------------------------------- #
@@ -269,6 +325,126 @@ def is_gpu(vm_size):
 
 
 # --------------------------------------------------------------------------- #
+# Performance (AVD Insights counters) and application profile
+# --------------------------------------------------------------------------- #
+
+CPU_TARGET_PCT = 80.0        # sizing target: hold p95 CPU at or below this
+CPU_OVERSIZED_PCT = 40.0     # peak-hour p95 below this -> host is oversized
+CPU_SATURATED_PCT = 85.0     # peak-hour p95 above this -> host is saturated
+INPUT_DELAY_WARN_MS = 150.0  # p95 input delay above this -> users notice lag
+
+# Windows shell / platform processes that appear in the per-process counter
+# on every session but say nothing about the user's workload.
+NOISE_PROCESSES = {
+    "dwm", "explorer", "svchost", "csrss", "winlogon", "sihost", "taskhostw",
+    "runtimebroker", "searchhost", "searchui", "searchapp", "searchindexer",
+    "startmenuexperiencehost", "shellexperiencehost", "textinputhost",
+    "ctfmon", "rdpclip", "lockapp", "applicationframehost", "systemsettings",
+    "conhost", "fontdrvhost", "backgroundtaskhost", "msedgewebview2",
+    "smartscreen", "securityhealthsystray", "userinit", "logonui", "wwahost",
+    "dllhost", "taskmgr", "wermgr", "werfault", "rdpinit", "rdpshell",
+    "rdpsa", "rdpsaproxy", "widgets", "phoneexperiencehost", "yourphone",
+    "screenclippinghost", "useroobebroker", "msiexec", "wuauclt",
+    "frxtray", "frxsvc", "frxccds", "rdagent", "rdagentbootloader",
+    "remotedesktopagent", "windowsazureguestagent", "waappagent",
+}
+
+
+def perf_for_group(d, machines, gs):
+    """Measured host metrics for one desktop group.
+
+    For each host with Insights data, only hours in which the host had at
+    least one connected session ('loaded hours') are considered. Returns a
+    dict of group means plus per-machine detail, or None if no host in the
+    group has any loaded hour with performance data.
+    """
+    per_machine = {}
+    for m in machines:
+        mk = short_host(m.get("sessionHostName", ""))
+        rows = d.perf.get(mk)
+        if not rows:
+            continue
+        vcpu = d.vcpu_of(mk)
+        mem_mb = (d.mem_gb_of(mk) or 0.0) * 1024.0
+        msess = [(s["start"], s["end"]) for s in gs if s["machine"] == mk]
+        loaded = []
+        for r in rows:
+            h0 = r["hour"]
+            h1 = h0 + timedelta(hours=1)
+            conc = sum(1 for s, e in msess if s < h1 and e > h0)
+            if conc > 0:
+                loaded.append((conc, r))
+        if not loaded:
+            continue
+        peak_conc = max(c for c, _ in loaded)
+        peak_cpu = [r["cpuP95Pct"] for c, r in loaded
+                    if c == peak_conc and r["cpuP95Pct"] is not None]
+        cpu_peak = statistics.mean(peak_cpu) if peak_cpu else None
+        need = ((cpu_peak / CPU_TARGET_PCT) * vcpu / peak_conc
+                if (vcpu and cpu_peak is not None) else None)
+        busy = [r["cpuP95Pct"] for _, r in loaded if r["cpuP95Pct"] is not None]
+        consumed = [(r["cpuAvgPct"] / 100.0) * vcpu / c for c, r in loaded
+                    if vcpu and r["cpuAvgPct"] is not None]
+        mem_user = [(mem_mb - r["memAvailMinMB"]) / c for c, r in loaded
+                    if mem_mb and r["memAvailMinMB"] is not None
+                    and mem_mb > r["memAvailMinMB"]]
+        delay95 = [r["inputDelayP95Ms"] for _, r in loaded if r["inputDelayP95Ms"] is not None]
+        delaymax = [r["inputDelayMaxMs"] for _, r in loaded if r["inputDelayMaxMs"] is not None]
+        disk = [r["diskLatencyAvgMs"] for _, r in loaded if r["diskLatencyAvgMs"] is not None]
+        rtt = [r["rttAvgMs"] for _, r in loaded if r["rttAvgMs"] is not None]
+        per_machine[mk] = {
+            "loaded_hours": len(loaded),
+            "peak_conc": peak_conc,
+            "cpu_busy_p95": statistics.mean(busy) if busy else None,
+            "cpu_peak_p95": cpu_peak,
+            "need_vcpu_user": need,
+            "consumed_vcpu_user": statistics.mean(consumed) if consumed else None,
+            "mem_mb_user": statistics.mean(mem_user) if mem_user else None,
+            "delay_p95": statistics.median(delay95) if delay95 else None,
+            "delay_max": max(delaymax) if delaymax else None,
+            "disk_ms": statistics.mean(disk) if disk else None,
+            "rtt_ms": statistics.mean(rtt) if rtt else None,
+        }
+    if not per_machine:
+        return None
+
+    def mean_of(k):
+        vals = [v[k] for v in per_machine.values() if v[k] is not None]
+        return statistics.mean(vals) if vals else None
+
+    g = {k: mean_of(k) for k in ("cpu_busy_p95", "cpu_peak_p95", "need_vcpu_user",
+                                 "consumed_vcpu_user", "mem_mb_user", "delay_p95",
+                                 "disk_ms", "rtt_ms")}
+    g["delay_max"] = max((v["delay_max"] for v in per_machine.values()
+                          if v["delay_max"] is not None), default=None)
+    g["hosts"] = len(per_machine)
+    g["per_machine"] = per_machine
+    return g
+
+
+def apps_for_group(d, machines, top_n=12):
+    """Aggregate the per-host application inventory for one group."""
+    agg = defaultdict(lambda: {"hours": 0.0, "days": 0.0, "hosts": 0, "delay": []})
+    for m in machines:
+        mk = short_host(m.get("sessionHostName", ""))
+        for a in d.apps.get(mk, []):
+            p = a["process"]
+            if p in NOISE_PROCESSES:
+                continue
+            agg[p]["hours"] += a["activeHours"]
+            agg[p]["days"] += a["sessionDays"]
+            agg[p]["hosts"] += 1
+            if a["delayP95"] is not None:
+                agg[p]["delay"].append(a["delayP95"])
+    rows = [{"process": p, "hours": v["hours"], "days": v["days"],
+             "hosts": v["hosts"],
+             "delay_p95": max(v["delay"]) if v["delay"] else None}
+            for p, v in agg.items()]
+    rows.sort(key=lambda r: (r["days"], r["hours"]), reverse=True)
+    return rows[:top_n]
+
+
+# --------------------------------------------------------------------------- #
 # Analysis
 # --------------------------------------------------------------------------- #
 
@@ -307,15 +483,26 @@ def analyse_group(d, group):
     avg_vcpu_per_user = (statistics.mean(vcpu_per_user_vals)
                          if vcpu_per_user_vals else None)
 
+    # measured performance (AVD Insights) and application profile
+    perf = perf_for_group(d, machines, gs) if d.has_perf else None
+    measured = perf["need_vcpu_user"] if perf else None
+    apps = apps_for_group(d, machines) if d.has_apps else []
+
     # persona
     support = (pool.get("sessionSupport") or "").strip()
     alloc = (pool.get("allocationType") or "").strip()
     sample_vm = machines[0] if machines else {}
     gpu = any(is_gpu(m.get("vmSize")) for m in machines)
+    band_basis = None
     if gpu:
         persona = "Power Worker"
     elif support == "MultiSession" and alloc == "Random":
-        persona = classify_task_band(avg_vcpu_per_user)
+        if measured is not None:
+            persona, band_basis = classify_task_band(measured), "measured"
+        elif avg_vcpu_per_user is not None:
+            persona, band_basis = classify_task_band(avg_vcpu_per_user), "allocated"
+        else:
+            persona, band_basis = classify_task_band(None), "default"
     elif support == "SingleSession" and alloc == "Random":
         persona = "Knowledge Worker (pooled)"
     elif support == "SingleSession" and alloc == "Static":
@@ -329,6 +516,7 @@ def analyse_group(d, group):
     return {
         "group": group,
         "persona": persona,
+        "band_basis": band_basis,
         "pool": pool,
         "sample_vm": sample_vm,
         "vm_count": vm_count,
@@ -339,6 +527,9 @@ def analyse_group(d, group):
         "machine_peaks": machine_peaks,
         "top_machines": top,
         "avg_vcpu_per_user": avg_vcpu_per_user,
+        "measured_vcpu_per_user": measured,
+        "perf": perf,
+        "apps": apps,
         "density": density,
         "sessions": gs,
     }
@@ -450,8 +641,8 @@ def build_report(d, groups, usage_group, usage_persona, args):
 
     # --- 2. Persona Mapping (per group) ---
     w("## 2. Persona Mapping (per desktop group)\n")
-    w("| Desktop Group | Persona | OS | Current VM | vCPU/user | Peak concurrent users | Unique users | VMs | Density (users/VM) | Alloc |")
-    w("|---|---|---|---|---|---|---|---|---|---|")
+    w("| Desktop Group | Persona | OS | Current VM | Alloc vCPU/user | Measured vCPU/user | Peak concurrent users | Unique users | VMs | Density (users/VM) | Alloc |")
+    w("|---|---|---|---|---|---|---|---|---|---|---|")
     for g in groups:
         vm = g["sample_vm"]
         os_desc = f"{vm.get('osType','?')}/{vm.get('imageSku','?')}"
@@ -459,10 +650,15 @@ def build_report(d, groups, usage_group, usage_persona, args):
         alloc = g["pool"].get("allocationType", "?")
         persist = "Persistent" if alloc == "Static" else "Non-persistent"
         band = g["persona"]
-        if band.startswith("Task Worker") and g["avg_vcpu_per_user"] is None:
+        if g["band_basis"] == "default":
             band += " *(default — no usage)*"
+        elif g["band_basis"] == "allocated" and d.has_perf:
+            band += " *(allocated — no perf data for this pool)*"
+        elif g["band_basis"] == "measured":
+            band += " *(measured)*"
         w(f"| {g['group']} | {band} | {os_desc} | {cur_vm} | "
-          f"{fmt(g['avg_vcpu_per_user'])} | {g['peak_users']} | {g['unique_users']} | "
+          f"{fmt(g['avg_vcpu_per_user'])} | {fmt(g['measured_vcpu_per_user'])} | "
+          f"{g['peak_users']} | {g['unique_users']} | "
           f"{g['vm_count']} | {fmt(g['density'])} | {alloc} ({persist}) |")
     w("")
 
@@ -551,8 +747,73 @@ def build_report(d, groups, usage_group, usage_persona, args):
           f"{fmt(monthly * g['unique_users'])} |")
     w("")
 
-    # --- 8. Insights & Recommendations ---
-    w("## 8. Insights & Recommendations\n")
+    # --- 8. Host Performance (AVD Insights counters) ---
+    w("## 8. Host Performance (AVD Insights counters)\n")
+
+    def pct(x, nd=1):
+        return f"{x:.{nd}f}%" if x is not None else "n/a"
+
+    if d.has_perf:
+        w("_Loaded hours only (host had at least one connected session). "
+          "'Required vCPU/user' is the vCPU per user needed to hold p95 CPU at "
+          f"{CPU_TARGET_PCT:.0f}% during each host's peak-concurrency hours; it is "
+          "the measured input to the Task Worker band._\n")
+        w("| Desktop Group | Hosts w/ data | Busy-hour CPU p95 | Peak-hour CPU p95 | Consumed vCPU/user | Required vCPU/user | Memory/user (GB) | Input delay p95 (ms) | Disk latency (ms) | RTT (ms) |")
+        w("|---|---|---|---|---|---|---|---|---|---|")
+        for g in groups:
+            p = g["perf"]
+            if not p:
+                w(f"| {g['group']} | 0 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |")
+                continue
+            mem_gb = p["mem_mb_user"] / 1024.0 if p["mem_mb_user"] is not None else None
+            w(f"| {g['group']} | {p['hosts']} | {pct(p['cpu_busy_p95'])} | "
+              f"{pct(p['cpu_peak_p95'])} | {fmt(p['consumed_vcpu_user'])} | "
+              f"{fmt(p['need_vcpu_user'])} | {fmt(mem_gb)} | {fmt(p['delay_p95'], 0)} | "
+              f"{fmt(p['disk_ms'], 1)} | {fmt(p['rtt_ms'], 0)} |")
+        w("")
+        flagged = []
+        for g in groups:
+            if not g["perf"]:
+                continue
+            for mk, v in g["perf"]["per_machine"].items():
+                reasons = []
+                if v["cpu_peak_p95"] is not None and v["cpu_peak_p95"] >= CPU_SATURATED_PCT:
+                    reasons.append(f"CPU p95 {v['cpu_peak_p95']:.0f}% at peak")
+                if v["delay_p95"] is not None and v["delay_p95"] >= INPUT_DELAY_WARN_MS:
+                    reasons.append(f"input delay p95 {v['delay_p95']:.0f} ms")
+                if reasons:
+                    flagged.append((g["group"], mk, v["peak_conc"], "; ".join(reasons)))
+        if flagged:
+            w("Hosts under pressure:")
+            for grp, mk, pc, why in sorted(flagged):
+                w(f"- `{mk}` ({grp}, peak {pc} session(s)): {why}")
+            w("")
+    else:
+        w("_No performance counters in this dataset (AVD Insights not enabled, or no "
+          "Perf data in the window). Task Worker bands use allocated vCPU per user._\n")
+
+    # --- 9. Application Profile ---
+    w("## 9. Application Profile (per desktop group)\n")
+    if d.has_apps:
+        w("_From the per-process input-delay counter: application image names with "
+          "the session-days and active hours in which they were observed. Windows "
+          "shell and platform processes are excluded. No user identifiers._\n")
+        for g in groups:
+            w(f"### {g['group']} — {g['persona']}")
+            if not g["apps"]:
+                w("_No application data for this pool._\n")
+                continue
+            w("| Application | Session-days | Active hours | Hosts | Input delay p95 (ms) |")
+            w("|---|---|---|---|---|")
+            for a in g["apps"]:
+                w(f"| `{a['process']}` | {a['days']:.0f} | {a['hours']:.0f} | "
+                  f"{a['hosts']} | {fmt(a['delay_p95'], 0)} |")
+            w("")
+    else:
+        w("_No application data in this dataset._\n")
+
+    # --- 10. Insights & Recommendations ---
+    w("## 10. Insights & Recommendations\n")
     busiest = max(groups, key=lambda g: g["peak_users"], default=None)
     if busiest and busiest["peak_users"] > 0:
         w(f"- **Peak demand driver:** `{busiest['group']}` "
@@ -564,16 +825,46 @@ def build_report(d, groups, usage_group, usage_persona, args):
               f"{len(idle_hosts)} host(s) with zero peak concurrency "
               f"({', '.join(idle_hosts)}) — candidates to deallocate or reclaim.")
     for g in groups:
-        if g["persona"].startswith("Task Worker") and g["avg_vcpu_per_user"]:
-            w(f"- **Right-sizing (`{g['group']}`):** observed "
-              f"{g['avg_vcpu_per_user']:.2f} vCPU/user → **{g['persona']}**; "
-              f"map to Citrix std {CITRIX_STD[g['persona']]}.")
+        if not g["persona"].startswith("Task Worker"):
+            continue
+        if g["measured_vcpu_per_user"] is not None:
+            v, basis = g["measured_vcpu_per_user"], "measured"
+        elif g["avg_vcpu_per_user"]:
+            v, basis = g["avg_vcpu_per_user"], "allocated"
+        else:
+            continue
+        w(f"- **Right-sizing (`{g['group']}`):** {basis} "
+          f"{v:.2f} vCPU/user → **{g['persona']}**; "
+          f"map to Citrix std {CITRIX_STD[g['persona']]}.")
+    for g in groups:
+        p = g["perf"]
+        if not p:
+            continue
+        if p["cpu_peak_p95"] is not None and p["cpu_peak_p95"] < CPU_OVERSIZED_PCT:
+            w(f"- **Oversized (`{g['group']}`):** peak-hour CPU p95 averages "
+              f"{p['cpu_peak_p95']:.0f}% across {p['hosts']} host(s) — room to raise "
+              "density or step down the VM size.")
+        if p["cpu_peak_p95"] is not None and p["cpu_peak_p95"] >= CPU_SATURATED_PCT:
+            w(f"- **Saturated (`{g['group']}`):** peak-hour CPU p95 averages "
+              f"{p['cpu_peak_p95']:.0f}% — users are CPU-bound at peak; size the "
+              "target up or lower density.")
+        if p["delay_p95"] is not None and p["delay_p95"] >= INPUT_DELAY_WARN_MS:
+            w(f"- **User experience (`{g['group']}`):** median input delay p95 is "
+              f"{p['delay_p95']:.0f} ms (threshold {INPUT_DELAY_WARN_MS:.0f} ms) — "
+              "users are likely noticing lag.")
+        if g["band_basis"] == "measured" and g["avg_vcpu_per_user"] is not None:
+            alloc_band = classify_task_band(g["avg_vcpu_per_user"])
+            if alloc_band != g["persona"]:
+                w(f"- **Band changed by measurement (`{g['group']}`):** allocation "
+                  f"suggests {alloc_band} ({g['avg_vcpu_per_user']:.2f} vCPU/user) but "
+                  f"measured load requires {g['measured_vcpu_per_user']:.2f} vCPU/user "
+                  f"→ **{g['persona']}**.")
     w("- Personas are non-exclusive; multi-group users appear in each pool's totals.")
     w("- Region(s): " + ", ".join(sorted({g['pool'].get('region','?') for g in groups})) + ".")
     w("")
 
-    # --- 9. Assumptions & Method ---
-    w("## 9. Assumptions & Method\n")
+    # --- 11. Assumptions & Method ---
+    w("## 11. Assumptions & Method\n")
     defaulted = [g["group"] for g in groups
                  if g["persona"].startswith("Task Worker") and g["avg_vcpu_per_user"] is None]
     w(f"- Timestamps are UTC. Lookback window: {lookback} days. "
@@ -590,6 +881,21 @@ def build_report(d, groups, usage_group, usage_persona, args):
           "had no usage in the window, so the Task Worker band defaults to Medium — "
           "classify from configuration or a longer lookback before proposing.")
     w(f"- Monthly projection uses {args.workdays} working days/month.")
+    if d.has_perf:
+        w("- Performance metrics use only hours in which a host had at least one "
+          "connected session. Required vCPU/user = (peak-hour CPU p95 ÷ "
+          f"{CPU_TARGET_PCT:.0f}%) × host vCPU ÷ peak concurrent sessions, averaged "
+          f"over hosts. Thresholds are heuristics: oversized < {CPU_OVERSIZED_PCT:.0f}%, "
+          f"saturated ≥ {CPU_SATURATED_PCT:.0f}%, input-delay warning ≥ "
+          f"{INPUT_DELAY_WARN_MS:.0f} ms p95.")
+        w("- Memory/user = (host RAM − minimum available MB in the hour) ÷ concurrent "
+          "sessions. It includes OS and shared overhead, so it overstates per-user "
+          "need on lightly loaded hosts.")
+    if d.has_apps:
+        w("- The application profile counts the hours and session-days in which an "
+          "image name appeared in the per-process input-delay counter. It shows what "
+          "ran with user focus, not CPU consumed per application. Shell and platform "
+          "processes are excluded.")
     w("- 'Software-Only / GCP' segmentation from the source methodology is not "
       "applicable: AVD runs only on Azure.")
     w("- Where a VM's vCPU could not be resolved, vCPU/user is shown as n/a.")
@@ -699,6 +1005,11 @@ def write_template_csv(path, d, groups, usage_group):
             cur_vm = (f"{vm.get('vmSize','')} "
                       f"({vm.get('vCPU','')} vCPU, {vm.get('memoryGB','')} GB)")
             avg_hrs = usage_group.get(g["group"], {}).get("overall", 0.0)
+            comment = f"pool={g['group']}; region={g['pool'].get('region','')}"
+            if g["measured_vcpu_per_user"] is not None:
+                comment += f"; measured vCPU/user={g['measured_vcpu_per_user']:.2f}"
+            if g["apps"]:
+                comment += "; top apps=" + "/".join(a["process"] for a in g["apps"][:5])
             wr.writerow([
                 g["persona"],
                 CITRIX_STD.get(g["persona"], ""),
@@ -713,7 +1024,7 @@ def write_template_csv(path, d, groups, usage_group):
                 "",                                   # future (proposal)
                 f"{avg_hrs:.2f} h",
                 f"{g['density']:.2f}",
-                f"pool={g['group']}; region={g['pool'].get('region','')}",
+                comment,
             ])
 
 
