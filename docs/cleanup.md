@@ -1,7 +1,7 @@
 ---
 layout: default
 title: Cleanup
-nav_order: 6
+nav_order: 7
 ---
 
 # Cleanup
