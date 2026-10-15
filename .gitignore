@@ -6,6 +6,9 @@ _avd_role.json
 # Collected data (may contain environment details / usernames)
 avd-data-*/
 
+# Python
+__pycache__/
+
 # Jekyll / GitHub Pages
 _site/
 .sass-cache/

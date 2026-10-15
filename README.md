@@ -111,10 +111,14 @@ customer to generate a **read-only, 7-day SAS link** to share.
 | ARM | `hostpools.csv` / `.json` | Inventory, sizing, config baseline |
 | ARM | `sessionhosts.csv` | Host counts, status, live sessions |
 | ARM | `appgroups.csv` | Desktop vs RemoteApp, entitlement counts |
-| KQL | `concurrency_<ws>.json` | Peak concurrent sessions/hour — **sizing** |
-| KQL | `density_<ws>.json` | Users per host vs. configured max — **right-sizing** |
-| KQL | `users_<ws>.csv` | Named vs active — **shelfware detection** |
+| KQL | `sessions.csv` | One row per connected session (hashed user, host, pool, start, end) — **concurrency, usage, shelfware** |
+| KQL | `hostperf.csv` | Hourly per-host CPU / memory / disk / input delay / RTT from AVD Insights — **measured sizing** |
+| KQL | `hostapps.csv` | Application image names per host with active hours — **application profile** |
 | — | `manifest.json` | Run metadata (lookback, hashed flag, counts) |
+
+> The current collector lives in the public `avd-analyzer` repo; the copy in
+> this repo predates it and still writes the legacy `concurrency_*` /
+> `density_*` / `users_*` files, which the analyzer does not read.
 
 ---
 
@@ -154,6 +158,15 @@ It implements the Citrix/VDI sizing methodology adapted to AVD:
   (`Machine_vCPU ÷ peak concurrency` over the top-10 machines: ≤0.5 / 0.51–1.19
   / ≥1.2); Knowledge Worker pooled (SingleSession+Random) / personal
   (SingleSession+Static); Power Worker (GPU SKU); Custom.
+- **Measured bands (AVD Insights)** — when `hostperf.csv` is present, the Task
+  Worker band uses *required vCPU/user* = (peak-hour CPU p95 ÷ 80%) × host vCPU
+  ÷ peak concurrent sessions, so a host that is 16-deep but idle classifies as
+  Light and one that is 8-deep and pegged classifies as Heavy. Memory/user,
+  input delay, disk latency and RTT are reported; hosts are flagged as
+  oversized (<40%), saturated (≥85%) or laggy (input delay p95 ≥150 ms).
+- **Application profile** — `hostapps.csv` (per-process input-delay counter)
+  gives the applications observed per pool, ranked by session-days, with shell
+  and platform processes filtered out.
 - **Usage & sizing** — per-user-per-day merged connected hours → average over
   *active* users → average of daily averages → × workdays for monthly demand;
   weekday/weekend split.
