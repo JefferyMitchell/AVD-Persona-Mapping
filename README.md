@@ -10,7 +10,7 @@ control until *they* generate a time-limited, read-only link and share it.
 
 📖 **Full guided documentation:** see the [`docs/`](docs/) folder (Prerequisites → Phase 1 → Phase 2 → Sharing → Cleanup → Troubleshooting).
 
-> This repo is **private**. The docs are a Jekyll site but public GitHub Pages hosting is intentionally disabled — read the Markdown in `docs/` directly, or run `bundle exec jekyll serve` locally. Re-enabling Pages would republish the site publicly (this plan has no private-Pages option).
+> This repo is **public**. The guided documentation is published at [jefferymitchell.github.io/AVD-Persona-Mapping](https://jefferymitchell.github.io/AVD-Persona-Mapping/), and the same pages are available as Markdown in [`docs/`](docs/).
 
 ---
 
